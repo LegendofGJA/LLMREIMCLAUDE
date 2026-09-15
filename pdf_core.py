@@ -1,40 +1,73 @@
 """
-pdf_core.py
-===========
-Gabungkan foto struk (dan sekarang juga screenshot Flazz) jadi satu PDF TANPA
-kompresi/downsizing sama sekali -- byte gambar asli dipakai apa adanya.
+pdf_core.py — Gabungkan gambar asli menjadi PDF TANPA kompresi/downsizing.
 
-Fix untuk img2pdf.ExifOrientationError: beberapa foto HP menyimpan tag EXIF
-Orientation yang tidak valid (mis. bernilai 0, padahal standar EXIF hanya
-mengenal 1-8). img2pdf secara default akan crash kalau ketemu ini. Solusinya
-BUKAN mengompres ulang gambar, tapi memberi tahu img2pdf untuk mengabaikan
-tag rotasi yang tidak valid (`rotation=Rotation.ifvalid`) -- gambar lain yang
-punya tag rotasi valid tetap dirotasi dengan benar seperti biasa, dan semua
-byte gambar tetap 100% utuh seperti file aslinya.
+Pakai img2pdf yang menyisipkan byte gambar apa adanya (lossless embedding).
+Untuk JPEG asli, byte dipertahankan (rotation=Rotation.ifvalid menangani EXIF
+orientation tidak standar). Untuk PNG (mis. screenshot Flazz/BCA), img2pdf
+kadang melempar "invalid png" bila chunk/header-nya tidak sempurna — maka PNG
+di-normalisasi lewat Pillow (re-encode PNG lossless) dulu sebelum digabung.
+Resolusi gambar TIDAK dikecilkan di sini.
 """
 
+import io
+
 import img2pdf
+from PIL import Image, ImageOps
+
+
+def _normalize_png(image_bytes: bytes) -> bytes:
+    """Re-encode PNG lossless lewat Pillow agar selalu valid bagi img2pdf.
+
+    Jika PNG bermasalah/truncated hingga tidak bisa dibuka Pillow, kembalikan
+    byte asli sebagai upaya terakhir."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+    except Exception:
+        return image_bytes
+
+    img = ImageOps.exif_transpose(img)
+
+    # Flatten alpha ke latar putih agar konsisten (receipt/screenshot).
+    if img.mode in ("RGBA", "LA") or (
+        img.mode == "P" and "transparency" in img.info
+    ):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        img = bg
+    else:
+        img = img.convert("RGB")
+
+    out = io.BytesIO()
+    img.save(out, format="PNG", optimize=False)
+    return out.getvalue()
+
+
+def _to_io(image_bytes: bytes) -> io.BytesIO:
+    return io.BytesIO(image_bytes)
 
 
 def merge_images_to_pdf(image_bytes_list: list) -> bytes:
-    """Gabungkan gambar asli ke satu PDF tanpa kompresi/downsizing.
-    `rotation=Rotation.ifvalid` membuat img2pdf mengabaikan tag EXIF
-    Orientation yang rusak/tidak valid alih-alih crash, tanpa menyentuh
-    byte gambar sama sekali.
-
-    Kalau versi img2pdf yang terpasang belum punya `Rotation.ifvalid` (atau
-    gambar punya orientasi aneh yang tetap ditolak), otomatis dicoba ulang
-    dengan mode rotasi lain supaya PDF tetap jadi."""
+    """Return bytes PDF dari list bytes gambar (JPEG/PNG), tanpa kompresi."""
     if not image_bytes_list:
-        raise ValueError("Tidak ada gambar untuk digabungkan ke PDF.")
+        return b""
 
-    rotation_ifvalid = getattr(getattr(img2pdf, "Rotation", None), "ifvalid", None)
-    if rotation_ifvalid is None:
-        # img2pdf lama: tidak kenal Rotation sama sekali
-        return img2pdf.convert(image_bytes_list)
+    normalized = []
+    for b in image_bytes_list:
+        # Deteksi format via header untuk memutuskan perlu normalisasi.
+        if b[:8] == b"\x89PNG\r\n\x1a\n":
+            normalized.append(_normalize_png(b))
+        else:
+            normalized.append(b)
 
+    streams = [_to_io(b) for b in normalized]
+    kwargs = {"rotation": img2pdf.Rotation.ifvalid}
     try:
-        return img2pdf.convert(image_bytes_list, rotation=rotation_ifvalid)
-    except getattr(img2pdf, "ExifOrientationError", ()):
-        # orientasi EXIF ditolak walau sudah ifvalid -> pakai tanpa rotasi
-        return img2pdf.convert(image_bytes_list, rotation=img2pdf.Rotation.none)
+        return img2pdf.convert(streams, **kwargs)
+    except img2pdf.ExifOrientationError:
+        # Fallback terakhir: paksa orientasi default tanpa membaca EXIF rotation.
+        return img2pdf.convert(streams)
+    except Exception:
+        # Jika tetap gagal (format tak dikenal), coba sekali tanpa opsi rotation.
+        return img2pdf.convert(streams)
