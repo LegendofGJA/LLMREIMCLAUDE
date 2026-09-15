@@ -129,7 +129,7 @@ def build_rows(extracted_items: list) -> pd.DataFrame:
                 "nominal": nominal,
             }
         )
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=["date", "category", "description", "nominal"])
     # struk tanpa tanggal terbaca ditaruh paling akhir, bukan hilang
     df["_sort_key"] = df["date"].apply(lambda d: d if d else date.max)
     df = df.sort_values(by="_sort_key", ascending=True).drop(columns=["_sort_key"]).reset_index(drop=True)
