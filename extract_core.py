@@ -38,6 +38,7 @@ Aturan klasifikasi "type":
 - Struk Teazzi atau minuman lain -> "drink"
 
 Ambil "nominal" sebagai TOTAL AKHIR yang benar-benar dibayar pada struk.
+"nominal" WAJIB angka polos tanpa titik/koma/pemisah ribuan (contoh: 50000, BUKAN "50.000" atau "Rp 50.000").
 Tanggal WAJIB diambil dari tanggal transaksi yang tertera di struk, bukan diasumsikan.
 "time" WAJIB diisi jam transaksi (format 24 jam "HH:MM") jika struk mencantumkan jam.
 Jika struk TIDAK mencantumkan jam sama sekali, isi "time" dengan null. Jangan mengarang jam.
@@ -62,6 +63,7 @@ Aturan:
 - Ambil tanggal sesuai baris transaksi (format mungkin "06 Jul 2026").
 - "time" diisi jam transaksi ("HH:MM", 24 jam) jika screenshot mencantumkan jam.
   Jika tidak ada jam pada baris tsb, isi null. Jangan mengarang jam.
+- "nominal" WAJIB angka polos tanpa titik/koma/pemisah ribuan (contoh: 8000, BUKAN "8.000").
 - Urutkan elemen array sesuai urutan tampil di screenshot.
 - Kembalikan JSON array murni saja, tidak ada teks lain sebelum/sesudahnya."""
 
@@ -148,18 +150,48 @@ def parse_time_safe(raw):
 
 
 def parse_nominal(value):
-    """Nominal -> float. Abaikan titik/koma/Rp, pertahankan tanda minus."""
+    """Nominal -> float. Menangani format Indonesia (titik = pemisah ribuan,
+    koma = desimal) maupun format internasional, plus prefix 'Rp' dan minus.
+    Model kadang membalas 'Rp 50.000' walau diminta angka polos — tanpa ini
+    '50.000' akan salah jadi 50.0."""
     if value is None:
         return 0.0
     if isinstance(value, (int, float)):
         return float(value)
-    cleaned = re.sub(r"[^\d.\-]", "", str(value))
-    if cleaned in ("", "-", ".", "-."):
+
+    text = str(value).strip()
+    if not text:
         return 0.0
+    negative = text.startswith("-") or (text.startswith("(") and text.endswith(")"))
+    text = re.sub(r"[^\d.,]", "", text)
+    if not text:
+        return 0.0
+
+    has_dot = "." in text
+    has_comma = "," in text
+
+    if has_dot and has_comma:
+        # Pemisah desimal = tanda yang muncul paling akhir.
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")  # 1.234,56
+        else:
+            text = text.replace(",", "")  # 1,234.56
+    elif has_comma:
+        parts = text.split(",")
+        if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]):
+            text = text.replace(",", "")  # 50,000 -> 50000
+        else:
+            text = text.replace(",", ".")  # 1,5 -> 1.5
+    elif has_dot:
+        parts = text.split(".")
+        if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]):
+            text = text.replace(".", "")  # 50.000 / 1.234.567 -> buang titik
+
     try:
-        return float(cleaned)
+        result = float(text)
     except ValueError:
         return 0.0
+    return -result if negative and result > 0 else result
 
 
 def _to_date(d):
