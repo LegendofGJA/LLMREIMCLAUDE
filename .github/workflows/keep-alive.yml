@@ -1,0 +1,21 @@
+name: Keep Alive Ping
+
+on:
+  schedule:
+    # Setiap hari 01:00 UTC (08:00 WIB) — Streamlit Community Cloud apps
+    # free tier akan sleep setelah ±48 jam tidak ada trafik; ping eksternal
+    # tidak bisa mencegah itu sepenuhnya, tapi workflow ini berguna kalau
+    # kamu arahkan ke URL app sendiri via repository variable.
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    if: ${{ vars.APP_URL != '' }}
+    steps:
+      - name: Ping app URL
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "${{ vars.APP_URL }}")
+          echo "HTTP status: $code"
+          test "$code" = "200" || test "$code" = "302" || test "$code" = "303"
