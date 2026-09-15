@@ -22,7 +22,7 @@ import time
 
 import requests
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ─────────────────────────────────────────────────────────────────────────
 # Konfigurasi provider (secrets, tidak pernah hardcoded)
@@ -120,38 +120,29 @@ def fetch_models(provider_name: str) -> list:
 
 
 def fetch_vision_models(provider_name: str) -> list:
-    """Daftar model VISION saja dari /models.
+    """Daftar model VISION saja dari /models (cepat, tanpa uji gambar).
 
-    Prioritas: pakai flag `vision: true` + `enabled` dari endpoint (akurat).
-    Hanya kalau provider tidak menyediakan flag tsb, baru menebak dari nama id
-    (`_is_vision`). Ini mencegah model text-only ikut masuk dropdown dan
-    membalas "this model does not support image input" saat OCR."""
+    Gabungan dari: flag `vision: true` DAN tebakan nama id (`_is_vision`).
+    Dipakai sebagai daftar default sebelum pengguna menjalankan "Scan semua
+    model". Flag provider tidak selalu akurat (Kagiro menandai Gemini
+    `vision: false` padahal bisa baca gambar), dan sebaliknya nama id saja
+    bisa keliru. Untuk daftar yang benar-benar terverifikasi, pakai
+    `scan_vision_models()`."""
     raw = _fetch_models_raw(provider_name)
 
     if raw:
-        # 1) Provider memberi flag vision -> pakai itu apa adanya.
-        if any("vision" in m for m in raw):
-            flagged = [
-                m["id"]
-                for m in raw
-                if m.get("vision") is True and m.get("enabled", True) is not False
-            ]
-            if flagged:
-                return flagged
-        # 2) Tanpa flag -> tebak dari nama id.
-        hinted = [
-            m["id"] for m in raw if _is_vision(m["id"]) and m.get("enabled", True) is not False
+        enabled = [m for m in raw if m.get("enabled", True) is not False] or raw
+        flagged = [
+            m["id"]
+            for m in enabled
+            if m.get("vision") is True
         ]
-        if hinted:
-            return hinted
-        # 3) Jangan biarkan dropdown kosong.
-        return [m["id"] for m in raw if m.get("enabled", True) is not False] or [
-            m["id"] for m in raw
-        ]
+        hinted = [m["id"] for m in enabled if _is_vision(m["id"])]
+        merged = list(dict.fromkeys(flagged + hinted))
+        return merged or [m["id"] for m in enabled]
 
-    # /models gagal total -> fallback default yang sudah difilter vision.
-    fallback_vision = [m for m in FALLBACK_MODELS if _is_vision(m)]
-    return fallback_vision or list(FALLBACK_MODELS)
+    # /models gagal total -> fallback default.
+    return list(FALLBACK_MODELS)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -352,3 +343,71 @@ def call_vision(
         except Exception as e:
             last_err = e
     raise last_err if last_err else RuntimeError("call_vision gagal")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Uji kemampuan vision per model (probe)
+# ─────────────────────────────────────────────────────────────────────────
+
+_PROBE_PROMPT = (
+    'Return ONLY this JSON and nothing else: '
+    '{"seen":"<the exact text visible in the image>"}'
+)
+
+
+def _probe_image_bytes() -> bytes:
+    """Gambar kecil berisi teks 'VISION-OK' untuk menguji apakah model
+    benar-benar membaca gambar (bukan sekadar mengembalikan teks acak)."""
+    img = Image.new("RGB", (480, 200), "white")
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default(size=64)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((30, 60), "VISION-OK", fill="black", font=font)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def probe_vision(provider_name: str, model: str, timeout: int = 30) -> tuple:
+    """Uji satu model: kirim gambar 'VISION-OK' lalu cek apakah model membacanya.
+
+    Return (ok: bool, detail: str). Model yang tidak bisa/mau baca gambar
+    (balas error, kosong, atau teks acak seperti provider rusak) -> ok=False."""
+    try:
+        parsed = _call_vision_once(
+            provider_name, model, _probe_image_bytes(), _PROBE_PROMPT, timeout, 0
+        )
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:120]}"
+
+    seen = str(parsed.get("seen", "")) if isinstance(parsed, dict) else str(parsed)
+    if "VISION-OK" in seen.upper():
+        return True, "OK"
+    return False, f"tidak membaca gambar (balasan: {seen.strip()[:60]!r})"
+
+
+def scan_vision_models(provider_name: str, timeout: int = 30, progress_cb=None) -> list:
+    """Probe SEMUA model provider dan kembalikan hanya yang benar-benar bisa
+    membaca gambar. Ini yang paling akurat karena tidak bergantung pada flag
+    `vision` (yang ternyata sering salah).
+
+    `progress_cb(i, total, model, ok, detail)` opsional untuk update UI.
+    """
+    raw = _fetch_models_raw(provider_name)
+    models = [m["id"] for m in raw if m.get("enabled", True) is not False] or [
+        m["id"] for m in raw
+    ]
+    if not models:
+        models = list(FALLBACK_MODELS)
+
+    working = []
+    total = len(models)
+    for i, model in enumerate(models):
+        ok, detail = probe_vision(provider_name, model, timeout=timeout)
+        if progress_cb:
+            progress_cb(i + 1, total, model, ok, detail)
+        if ok:
+            working.append(model)
+    return working
