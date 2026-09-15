@@ -59,6 +59,24 @@ PROVIDERS = load_providers()
 # ─────────────────────────────────────────────────────────────────────────
 
 
+def _filter_vision_models(models_raw: list) -> list:
+    """Ambil HANYA model yang mendukung input gambar (vision=true) dan tidak
+    dinonaktifkan provider (enabled bukan false). Ini mencegah pengguna memilih
+    model text-only untuk OCR (mis. "auto" di Bandel) yang pasti gagal karena
+    gambar diabaikan. Kalau provider tidak mencantumkan flag vision sama sekali,
+    kembalikan daftar kosong supaya pemanggil memakai semua model sebagai
+    fallback."""
+    if not isinstance(models_raw, list):
+        return []
+    vision = []
+    for m in models_raw:
+        if not isinstance(m, dict) or "id" not in m:
+            continue
+        if m.get("vision") is True and m.get("enabled", True) is not False:
+            vision.append(m["id"])
+    return vision
+
+
 def test_ping_and_get_models(provider_name: str) -> dict:
     """Cek satu provider dan kembalikan diagnosis lengkap:
     {"ok": bool, "status": "<pesan detail>", "models": [...]}"""
@@ -87,14 +105,15 @@ def test_ping_and_get_models(provider_name: str) -> dict:
         except ValueError:
             return {"ok": False, "status": "⚠️ HTTP 200 tapi respons bukan JSON valid — base_url mungkin tidak mengarah ke endpoint /models yang benar.", "models": []}
         models_raw = data.get("data", data) if isinstance(data, dict) else data
-        model_list = (
-            [m.get("id") for m in models_raw if isinstance(m, dict) and "id" in m]
+        all_models = (
+            [m for m in models_raw if isinstance(m, dict) and "id" in m]
             if isinstance(models_raw, list)
             else []
         )
-        if not model_list:
+        if not all_models:
             return {"ok": False, "status": f"⚠️ HTTP 200 ({elapsed:.1f}s) tapi daftar model kosong — API key mungkin tidak punya akses ke model apa pun.", "models": []}
-        return {"ok": True, "status": f"✅ Terhubung, {len(model_list)} model tersedia ({elapsed:.1f}s).", "models": model_list}
+        model_list = _filter_vision_models(all_models) or [m["id"] for m in all_models]
+        return {"ok": True, "status": f"✅ Terhubung, {len(model_list)} model vision tersedia ({elapsed:.1f}s).", "models": model_list}
 
     if code == 401:
         return {"ok": False, "status": "❌ 401 Unauthorized — API key salah atau sudah kedaluwarsa.", "models": []}
@@ -203,8 +222,13 @@ def _vision_chat_raw(provider_name: str, model: str, image_bytes: bytes, prompt:
         try:
             res = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
             res.raise_for_status()
-            content_text = res.json()["choices"][0]["message"]["content"]
-            return re.sub(r"```json|```", "", content_text).strip()
+            message = res.json()["choices"][0]["message"]
+            content_text = (message.get("content") or "").strip()
+            if not content_text:
+                content_text = (message.get("reasoning_content") or "").strip()
+            if not content_text:
+                raise ValueError("Provider mengembalikan respons kosong (tidak ada konten teks).")
+            return content_text
         except requests.exceptions.HTTPError as e:
             last_err = e
             status_code = e.response.status_code if e.response is not None else None
@@ -225,19 +249,88 @@ def _vision_chat_raw(provider_name: str, model: str, image_bytes: bytes, prompt:
     raise last_err
 
 
-def call_vision_api(provider_name: str, model: str, image_bytes: bytes) -> dict:
-    """Ekstraksi satu foto struk fisik (bensin/parkir/drink) -> satu dict transaksi."""
-    content_text = _vision_chat_raw(provider_name, model, image_bytes, EXTRACTION_PROMPT)
-    return json.loads(content_text)
+def _extract_json(text: str):
+    """Ambil JSON dari respons model yang mungkin dibungkus markdown atau
+    diapit teks lain. Melempar ValueError yang jelas kalau memang tidak ada
+    JSON sama sekali -- ini yang menangkap provider 'nakal' yang membalas
+    HTTP 200 tapi isinya bukan hasil OCR (mis. kalimat acak)."""
+    cleaned = re.sub(r"```(?:json)?", "", str(text)).strip()
+    try:
+        return json.loads(cleaned)
+    except (ValueError, TypeError):
+        pass
+
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = cleaned.find(opener)
+        while start != -1:
+            depth = 0
+            for i in range(start, len(cleaned)):
+                if cleaned[i] == opener:
+                    depth += 1
+                elif cleaned[i] == closer:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(cleaned[start:i + 1])
+                        except (ValueError, TypeError):
+                            break
+            start = cleaned.find(opener, start + 1)
+
+    snippet = cleaned[:200].replace("\n", " ")
+    raise ValueError(f"Respons model bukan JSON valid — gambar kemungkinan tidak diproses. Respons: {snippet!r}")
 
 
-def call_vision_api_flazz(provider_name: str, model: str, image_bytes: bytes) -> list:
+def _provider_plans(provider_name: str, model: str, results: dict | None) -> list:
+    """Susun urutan (provider, model) yang akan dicoba: provider terpilih lebih
+    dulu, lalu provider lain yang sehat memakai model vision pertamanya. Ini
+    yang membuat OCR tetap jalan walau provider terpilih ternyata rusak (mis.
+    proxy yang membalas HTTP 200 tapi isinya bukan hasil OCR)."""
+    plans = []
+    if provider_name and model:
+        plans.append((provider_name, model))
+    for pname, r in (results or {}).items():
+        if pname == provider_name or not r.get("ok"):
+            continue
+        models = r.get("models") or []
+        if models:
+            plans.append((pname, models[0]))
+    return plans
+
+
+def call_vision_api(provider_name: str, model: str, image_bytes: bytes, results: dict | None = None) -> dict:
+    """Ekstraksi satu foto struk fisik (bensin/parkir/drink) -> satu dict transaksi.
+    Mencoba provider terpilih dulu, lalu fallback ke provider sehat lainnya
+    kalau responsnya tidak valid (lihat `_provider_plans`)."""
+    plans = _provider_plans(provider_name, model, results) or [(provider_name, model)]
+    last_err = None
+    for pname, m in plans:
+        try:
+            content_text = _vision_chat_raw(pname, m, image_bytes, EXTRACTION_PROMPT)
+            data = _extract_json(content_text)
+            if not isinstance(data, dict):
+                raise ValueError("Respons OCR bukan objek JSON — gambar kemungkinan tidak diproses model.")
+            return data
+        except Exception as e:  # coba provider berikutnya, jangan langsung menyerah
+            last_err = e
+    raise last_err
+
+
+def call_vision_api_flazz(provider_name: str, model: str, image_bytes: bytes, results: dict | None = None) -> list:
     """Ekstraksi satu screenshot riwayat Flazz/e-money -> list beberapa transaksi sekaligus."""
-    content_text = _vision_chat_raw(provider_name, model, image_bytes, EXTRACTION_PROMPT_FLAZZ)
-    parsed = json.loads(content_text)
-    if isinstance(parsed, dict):
-        for v in parsed.values():
-            if isinstance(v, list):
-                return v
-        return []
-    return parsed if isinstance(parsed, list) else []
+    plans = _provider_plans(provider_name, model, results) or [(provider_name, model)]
+    last_err = None
+    for pname, m in plans:
+        try:
+            content_text = _vision_chat_raw(pname, m, image_bytes, EXTRACTION_PROMPT_FLAZZ)
+            parsed = _extract_json(content_text)
+            if isinstance(parsed, dict):
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        return v
+                return []
+            if isinstance(parsed, list):
+                return parsed
+            raise ValueError("Respons OCR Flazz bukan JSON array.")
+        except Exception as e:
+            last_err = e
+    raise last_err
