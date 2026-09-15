@@ -26,7 +26,7 @@ from extract_core import (
     dedupe_flazz_against_receipts,
 )
 from gps_core import gps_location_name, read_gps
-from llm_core import PROVIDERS, fetch_vision_models, ping_model
+from llm_core import PROVIDERS, fetch_vision_models, ping_model, scan_vision_models
 from llm_core import call_vision
 from pdf_core import merge_images_to_pdf
 
@@ -94,21 +94,26 @@ st.subheader("Pemilihan Provider OCR")
 
 provider_name = st.selectbox("Pilih Provider OCR", list(PROVIDERS.keys()))
 
-# Daftar model vision di-cache per provider supaya rerun Streamlit (mis. ganti
-# widget) tidak memanggil ulang endpoint /models berulang-ulang.
-_models_cache_key = f"vision_models_{provider_name}"
-if _models_cache_key not in st.session_state:
+# Daftar model di-cache per provider supaya rerun Streamlit (mis. ganti widget)
+# tidak memanggil ulang endpoint /models berulang-ulang.
+_quick_key = f"vision_models_{provider_name}"
+_scan_key = f"vision_scan_{provider_name}"
+if _quick_key not in st.session_state:
     try:
-        st.session_state[_models_cache_key] = fetch_vision_models(provider_name)
+        st.session_state[_quick_key] = fetch_vision_models(provider_name)
     except Exception as e:
-        st.session_state[_models_cache_key] = []
+        st.session_state[_quick_key] = []
         st.warning(f"Gagal mengambil daftar model: {e}")
 
-available_models = st.session_state[_models_cache_key]
+# Kalau sudah pernah di-scan, hasil scan (terverifikasi bisa baca gambar) yang
+# dipakai. Kalau belum, pakai daftar cepat (flag vision + tebakan nama).
+_scanned = st.session_state.get(_scan_key)
+available_models = _scanned if _scanned else st.session_state[_quick_key]
 
 ref_col, model_col = st.columns([1, 3])
 with ref_col:
-    refresh_clicked = st.button("🔄 Refresh daftar model")
+    scan_clicked = st.button("🔍 Scan semua model (uji gambar)")
+    refresh_clicked = st.button("🔄 Refresh daftar cepat")
 with model_col:
     selected_model = st.selectbox(
         "Pilih Model Vision",
@@ -116,31 +121,59 @@ with model_col:
     )
 
 if refresh_clicked:
-    st.session_state.pop(_models_cache_key, None)
+    st.session_state.pop(_quick_key, None)
+    st.session_state.pop(_scan_key, None)
     st.rerun()
 
+if scan_clicked:
+    bar = st.progress(0.0, text="Menguji semua model dengan gambar kecil...")
+
+    def _cb(i, total, model, ok, detail):
+        bar.progress(i / total, text=f"{i}/{total} — {'OK' if ok else 'gagal'}: {model}")
+
+    working = scan_vision_models(provider_name, progress_cb=_cb)
+    bar.empty()
+    st.session_state[_scan_key] = working
+    st.session_state[f"vision_scan_note_{provider_name}"] = (
+        f"{len(working)} model vision lolos uji."
+        if working
+        else "Tidak ada model yang lolos uji gambar."
+    )
+    st.rerun()
+
+_note = st.session_state.get(f"vision_scan_note_{provider_name}")
+if _note:
+    st.caption(f"Hasil scan {provider_name}: {_note}")
+
 st.caption(
-    "Daftar hanya model **vision** (bisa baca gambar). Tidak ada ping otomatis — "
-    "kalau ingin menguji model terpilih, pakai tombol Cek API Hidup di bawah."
+    "Daftar awal = flag vision + tebakan nama. Tekan **Scan semua model** untuk "
+    "menguji tiap model dengan gambar sungguhan — hanya model yang benar-benar "
+    "bisa baca gambar yang akan muncul di dropdown."
 )
 
 
 def _fallback_plans(chosen_provider: str) -> list:
     """(provider, model) cadangan dari provider lain, dipakai otomatis bila
     provider terpilih gagal / balasannya bukan JSON (mis. proxy yang membalas
-    HTTP 200 tapi isi bukan hasil OCR). Di-cache per provider di session_state."""
+    HTTP 200 tapi isi bukan hasil OCR). Di-cache per provider di session_state,
+    dan memakai hasil scan (terverifikasi) kalau sudah ada."""
     plans = []
     for p in PROVIDERS:
         if p == chosen_provider:
             continue
-        key = f"vision_models_{p}"
-        if key not in st.session_state:
-            try:
-                st.session_state[key] = fetch_vision_models(p)
-            except Exception:
-                st.session_state[key] = []
-        if st.session_state[key]:
-            plans.append((p, st.session_state[key][0]))
+        scanned = st.session_state.get(f"vision_scan_{p}")
+        if scanned:
+            models = scanned
+        else:
+            key = f"vision_models_{p}"
+            if key not in st.session_state:
+                try:
+                    st.session_state[key] = fetch_vision_models(p)
+                except Exception:
+                    st.session_state[key] = []
+            models = st.session_state[key]
+        if models:
+            plans.append((p, models[0]))
     return plans
 
 if provider_name and selected_model != "Model tidak tersedia":
