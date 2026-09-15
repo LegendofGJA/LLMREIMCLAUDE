@@ -1,13 +1,20 @@
 """
-llm_core.py
-===========
-Konfigurasi provider AI vision (Kagiro / Bandel), health-check yang detail
-(bukan cuma HTTP 200 -- membedakan timeout, 401/403/404/429/5xx, model kosong,
-dll), dan pemanggilan API ekstraksi struk/screenshot dengan retry otomatis +
-kompresi gambar (supaya tidak kena 413 Payload Too Large atau timeout).
+llm_core.py — Koneksi provider AI vision (Kagiro / Bandel).
+
+Menyediakan:
+  - `PROVIDERS`       : konfigurasi provider dari st.secrets (bukan hardcoded).
+  - `fetch_models`    : ambil daftar model dari endpoint /models (fallback default).
+  - `ping_model`      : tes API "hidup" dengan KIRIM completion kecil BENERAN,
+                        bukan cuma HTTP 200 pada /models — sehingga model yang
+                        terdaftar tapi tidak merespons akan terdeteksi.
+  - `prepare_image`   : resize + re-encode JPEG agar payload aman (menghindari
+                        HTTP 413 Payload Too Large dari server).
+  - `call_vision`     : panggil chat/completions dengan timeout panjang + retry
+                        + backoff (menghindari read timeout).
 """
 
 import base64
+import io
 import json
 import os
 import re
@@ -15,14 +22,10 @@ import time
 
 import requests
 import streamlit as st
-
-import image_utils
+from PIL import Image, ImageOps
 
 # ─────────────────────────────────────────────────────────────────────────
-# KONFIGURASI PROVIDER
-# API key TIDAK ditulis langsung di kode. Diambil dari st.secrets (file
-# .streamlit/secrets.toml lokal, atau menu "Secrets" di Streamlit Community
-# Cloud) dengan fallback ke environment variable.
+# Konfigurasi provider (secrets, tidak pernah hardcoded)
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -35,226 +38,215 @@ def _get_secret(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
-def load_providers() -> dict:
-    providers = {
-        "Kagiro": {
-            "base_url": _get_secret("KAGIRO_BASE_URL", "https://api.kagiro.net/v1"),
-            "api_key": _get_secret("KAGIRO_API_KEY"),
-        },
-        "Bandel": {
-            "base_url": _get_secret("BANDEL_BASE_URL", "https://bandelbanget.xyz/v1"),
-            "api_key": _get_secret("BANDEL_API_KEY"),
-        },
-    }
-    # provider tanpa API key otomatis di-skip supaya tidak muncul error
-    # membingungkan kalau salah satu provider memang belum dikonfigurasi.
-    return {name: cfg for name, cfg in providers.items() if cfg["api_key"]}
+PROVIDERS = {
+    "Kagiro": {
+        "base_url": _get_secret("KAGIRO_BASE_URL", "https://api.kagiro.net/v1"),
+        "api_key": _get_secret("KAGIRO_API_KEY"),
+    },
+    "Bandel": {
+        "base_url": _get_secret("BANDEL_BASE_URL", "https://bandelbanget.xyz/v1"),
+        "api_key": _get_secret("BANDEL_API_KEY"),
+    },
+}
+# Provider tanpa API key di-skip (supaya tidak error saat salah satu belum di-set).
+PROVIDERS = {k: v for k, v in PROVIDERS.items() if v["api_key"]}
+
+# Fallback kalau endpoint /models tidak tersedia / kosong.
+FALLBACK_MODELS = [
+    "qwen-vl-max",
+    "qwen2.5-vl-72b-instruct",
+    "qwen-vl-max-latest",
+    "gpt-4o",
+    "gpt-4o-mini",
+]
 
 
-PROVIDERS = load_providers()
+def _auth_headers(cfg: dict) -> dict:
+    return {"Authorization": f"Bearer {cfg['api_key']}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# HEALTH CHECK -- detail, bukan cuma "HTTP 200"
+# Daftar model
 # ─────────────────────────────────────────────────────────────────────────
 
 
-def _filter_vision_models(models_raw: list) -> list:
-    """Ambil HANYA model yang mendukung input gambar (vision=true) dan tidak
-    dinonaktifkan provider (enabled bukan false). Ini mencegah pengguna memilih
-    model text-only untuk OCR (mis. "auto" di Bandel) yang pasti gagal karena
-    gambar diabaikan. Kalau provider tidak mencantumkan flag vision sama sekali,
-    kembalikan daftar kosong supaya pemanggil memakai semua model sebagai
-    fallback."""
-    if not isinstance(models_raw, list):
-        return []
-    vision = []
-    for m in models_raw:
-        if not isinstance(m, dict) or "id" not in m:
-            continue
-        if m.get("vision") is True and m.get("enabled", True) is not False:
-            vision.append(m["id"])
-    return vision
+# Pola id yang lazim untuk model VISION (bisa menerima input gambar).
+# Jika endpoint /models tidak memberi flag "vision"/"image", kita filter
+# berdasarkan nama id supaya dropdown hanya menampilkan model vision.
+_VISION_HINTS = (
+    "vl",
+    "vision",
+    "flash-vision",
+    "gpt-4o",  # gpt-4o sebenarnya multimodal, pertahankan sebagai vision hint
+    "gpt-4.1",
+    "gemini",
+    "claude",
+    "minimax-vl",
+    "internvl",
+    "glm-4v",
+    "glm-4.5v",
+    "qwen-vl",
+    "qwen2.5-vl",
+    "kimi-k",
+    "kimi-latest",
+)
 
 
-def test_ping_and_get_models(provider_name: str) -> dict:
-    """Cek satu provider dan kembalikan diagnosis lengkap:
-    {"ok": bool, "status": "<pesan detail>", "models": [...]}"""
+def _is_vision(model_id: str) -> bool:
+    m = model_id.lower()
+    return any(h in m for h in _VISION_HINTS)
+
+
+def _fetch_models_raw(provider_name: str) -> list:
+    """Ambil objek model mentah dari /models (list of dict). Gagal -> []."""
     cfg = PROVIDERS[provider_name]
     url = f"{cfg['base_url']}/models"
-    headers = {"Authorization": f"Bearer {cfg['api_key']}"}
-
-    t0 = time.time()
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-    except requests.exceptions.ConnectTimeout:
-        return {"ok": False, "status": "❌ Connect timeout — server tidak merespons handshake sama sekali.", "models": []}
-    except requests.exceptions.ReadTimeout:
-        return {"ok": False, "status": "❌ Read timeout — server konek tapi tidak balas dalam waktu wajar.", "models": []}
-    except requests.exceptions.ConnectionError as e:
-        return {"ok": False, "status": f"❌ Gagal konek ({type(e).__name__}) — cek base_url / DNS / server sedang down.", "models": []}
-    except requests.exceptions.RequestException as e:
-        return {"ok": False, "status": f"❌ Request error: {e}", "models": []}
+        r = requests.get(url, headers=_auth_headers(cfg), timeout=12)
+        if r.status_code == 200:
+            data = r.json()
+            models = data.get("data", data)
+            if isinstance(models, list):
+                return [m for m in models if isinstance(m, dict) and m.get("id")]
+    except Exception:
+        pass
+    return []
 
-    elapsed = time.time() - t0
-    code = response.status_code
 
-    if code == 200:
-        try:
-            data = response.json()
-        except ValueError:
-            return {"ok": False, "status": "⚠️ HTTP 200 tapi respons bukan JSON valid — base_url mungkin tidak mengarah ke endpoint /models yang benar.", "models": []}
-        models_raw = data.get("data", data) if isinstance(data, dict) else data
-        all_models = (
-            [m for m in models_raw if isinstance(m, dict) and "id" in m]
-            if isinstance(models_raw, list)
-            else []
-        )
-        if not all_models:
-            return {"ok": False, "status": f"⚠️ HTTP 200 ({elapsed:.1f}s) tapi daftar model kosong — API key mungkin tidak punya akses ke model apa pun.", "models": []}
-        model_list = _filter_vision_models(all_models) or [m["id"] for m in all_models]
-        return {"ok": True, "status": f"✅ Terhubung, {len(model_list)} model vision tersedia ({elapsed:.1f}s).", "models": model_list}
+def fetch_models(provider_name: str) -> list:
+    """Ambil daftar model id dari /models. Gagal -> fallback default."""
+    ids = [m["id"] for m in _fetch_models_raw(provider_name)]
+    return ids or list(FALLBACK_MODELS)
 
-    if code == 401:
-        return {"ok": False, "status": "❌ 401 Unauthorized — API key salah atau sudah kedaluwarsa.", "models": []}
-    if code == 403:
-        return {"ok": False, "status": "❌ 403 Forbidden — API key tidak punya izin akses endpoint ini.", "models": []}
-    if code == 404:
-        return {"ok": False, "status": "❌ 404 Not Found — base_url kemungkinan salah, atau provider ini tidak punya endpoint /models.", "models": []}
-    if code == 429:
-        return {"ok": False, "status": "⚠️ 429 Too Many Requests — rate limit tercapai, coba lagi sebentar lagi.", "models": []}
-    if 500 <= code < 600:
-        return {"ok": False, "status": f"❌ {code} Server Error — masalah di sisi provider, bukan konfigurasi aplikasi ini.", "models": []}
-    return {"ok": False, "status": f"⚠️ HTTP {code} — kode status tidak dikenali.", "models": []}
+
+def fetch_vision_models(provider_name: str) -> list:
+    """Daftar model VISION saja dari /models.
+
+    Prioritas: pakai flag `vision: true` + `enabled` dari endpoint (akurat).
+    Hanya kalau provider tidak menyediakan flag tsb, baru menebak dari nama id
+    (`_is_vision`). Ini mencegah model text-only ikut masuk dropdown dan
+    membalas "this model does not support image input" saat OCR."""
+    raw = _fetch_models_raw(provider_name)
+
+    if raw:
+        # 1) Provider memberi flag vision -> pakai itu apa adanya.
+        if any("vision" in m for m in raw):
+            flagged = [
+                m["id"]
+                for m in raw
+                if m.get("vision") is True and m.get("enabled", True) is not False
+            ]
+            if flagged:
+                return flagged
+        # 2) Tanpa flag -> tebak dari nama id.
+        hinted = [
+            m["id"] for m in raw if _is_vision(m["id"]) and m.get("enabled", True) is not False
+        ]
+        if hinted:
+            return hinted
+        # 3) Jangan biarkan dropdown kosong.
+        return [m["id"] for m in raw if m.get("enabled", True) is not False] or [
+            m["id"] for m in raw
+        ]
+
+    # /models gagal total -> fallback default yang sudah difilter vision.
+    fallback_vision = [m for m in FALLBACK_MODELS if _is_vision(m)]
+    return fallback_vision or list(FALLBACK_MODELS)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Ping API "hidup" — kirim completion asli, bukan cuma HTTP 200
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def ping_model(provider_name: str, model: str) -> tuple:
+    """Kirim completion kecil beneran ke model dan laporkan hasilnya.
+
+    Return (ok: bool, pesan: str, ms: int|None).
+    """
+    cfg = PROVIDERS[provider_name]
+    url = f"{cfg['base_url']}/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 5,
+        "temperature": 0,
+    }
+    headers = {**_auth_headers(cfg), "Content-Type": "application/json"}
+    start = time.time()
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        ms = int((time.time() - start) * 1000)
+        if r.status_code == 200:
+            data = r.json()
+            content = ""
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                content = ""
+            if content is None or str(content).strip() == "":
+                return False, f"⚠️ HTTP 200 tapi balasan kosong ({ms} ms)", ms
+            return True, f"✅ Model merespons beneran ({ms} ms)", ms
+        else:
+            return False, f"❌ Status {r.status_code}: {r.text[:120]}", ms
+    except Exception as e:
+        return False, f"❌ Gagal terhubung ({e})", None
 
 
 def check_all_providers() -> dict:
-    """Cek SEMUA provider (tidak short-circuit di provider pertama yang
-    berhasil), supaya status setiap provider selalu bisa ditampilkan."""
-    return {name: test_ping_and_get_models(name) for name in PROVIDERS}
+    """Scan semua provider: daftar model (tanpa ping per model).
 
-
-def pick_best_provider(results: dict):
-    """Pilih provider pertama yang 'ok' dari hasil check_all_providers()."""
-    for name, r in results.items():
-        if r["ok"]:
-            return name
-    return next(iter(results), None)
+    Return {provider_name: {"models": [id vision...]}}
+    """
+    out = {}
+    for name in PROVIDERS:
+        out[name] = {"models": fetch_vision_models(name)}
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# EKSTRAKSI VISION (struk fisik & screenshot Flazz)
+# Siapkan gambar (hindari 413 + byte kecil)
 # ─────────────────────────────────────────────────────────────────────────
 
 
-def encode_image(file_bytes: bytes) -> str:
-    return base64.b64encode(file_bytes).decode("utf-8")
+def prepare_image(file_bytes: bytes, max_side: int = 1600, quality: int = 85) -> bytes:
+    """Resize gambar ke max_side dan re-encode jadi JPEG sehingga payload
+    base64-nya tetap kecil (teks struk tetap terbaca). Gambar asli TIDAK
+    diubah (dipakai untuk PDF gabungan)."""
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+        img = ImageOps.exif_transpose(img)  # bakar rotasi agar OCR tidak salah orientasi
+        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            # Flatten alpha ke latar putih (bukan hitam) supaya teks tetap terbaca.
+            rgba = img.convert("RGBA")
+            bg = Image.new("RGB", rgba.size, (255, 255, 255))
+            bg.paste(rgba, mask=rgba.split()[-1])
+            img = bg
+        else:
+            img = img.convert("RGB")
+    except Exception:
+        return file_bytes
+    w, h = img.size
+    longest = max(w, h)
+    if longest > max_side:
+        ratio = max_side / float(longest)
+        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
 
 
-EXTRACTION_PROMPT = """Kamu adalah sistem OCR untuk struk belanja Indonesia.
-Analisis gambar struk ini dan kembalikan HANYA JSON murni (tanpa markdown, tanpa teks tambahan) dengan struktur persis berikut:
-
-{
-  "date": "YYYY-MM-DD",
-  "type": "bensin" | "parkir" | "drink",
-  "nominal": <angka total akhir struk, tanpa titik/koma/Rp>,
-  "fuel_type": "<nama jenis BBM apa adanya di struk, contoh: Pertalite / Pertamax / Pertamax Turbo, atau null jika bukan bensin>",
-  "liters": <jumlah liter sebagai angka, atau null jika tidak ada / bukan bensin>,
-  "drink_name": "<jenis/menu minuman yang dibeli, atau null jika bukan drink>",
-  "outlet_name": "<nama toko/outlet, contoh Teazzi, atau null jika bukan drink>",
-  "location_name": "<nama tempat/lokasi parkir, atau null jika bukan parkir. Jika parkir tapi nama tempat tidak tertera, isi dengan '-'>"
-}
-
-Aturan klasifikasi "type":
-- Struk pom bensin / SPBU -> "bensin"
-- Struk parkir -> "parkir"
-- Struk Teazzi atau minuman lain -> "drink"
-
-Ambil "nominal" sebagai TOTAL AKHIR yang benar-benar dibayar pada struk.
-Tanggal WAJIB diambil dari tanggal transaksi yang tertera di struk, bukan diasumsikan.
-Kembalikan JSON murni saja, tidak ada teks lain sebelum atau sesudahnya."""
-
-EXTRACTION_PROMPT_FLAZZ = """Kamu adalah sistem OCR untuk screenshot riwayat transaksi kartu e-money (Flazz/BCA dsb).
-Gambar ini berisi DAFTAR beberapa transaksi sekaligus (bukan satu struk tunggal). Untuk SETIAP baris
-transaksi yang terlihat di gambar -- termasuk yang terpotong di ujung atas/bawah layar selama tanggalnya
-masih terbaca -- ekstrak:
-
-- date: gabungkan tanggal-bulan-tahun yang ditampilkan terpisah di layar, hasil akhir format YYYY-MM-DD
-- type: "Parking" jika baris berjudul Parking/Parkir, "Top Up" jika baris top up, atau nama kategori lain apa adanya jika berbeda
-- nominal: angka rupiah transaksi tersebut, tanpa titik/koma/IDR/Rp
-
-Kembalikan HANYA JSON array murni (tanpa markdown, tanpa teks tambahan), contoh:
-[{"date": "2026-07-10", "type": "Parking", "nominal": 8000}, {"date": "2026-07-09", "type": "Parking", "nominal": 7000}]
-
-ABAIKAN baris "Balance" / info saldo di bagian atas layar, itu bukan transaksi.
-Kembalikan array JSON murni saja, tidak ada teks lain sebelum atau sesudahnya."""
-
-
-def _vision_chat_raw(provider_name: str, model: str, image_bytes: bytes, prompt: str, timeout: int = 60, max_retries: int = 2) -> str:
-    """Panggil chat completion vision dengan gambar TERKOMPRESI (khusus untuk
-    API call ini saja -- tidak memengaruhi file asli yang dipakai di PDF).
-    Otomatis retry saat timeout, dan mengompres lebih agresif kalau kena 413."""
-    cfg = PROVIDERS[provider_name]
-    api_url = f"{cfg['base_url']}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {cfg['api_key']}",
-        "Content-Type": "application/json",
-    }
-
-    compressed = image_utils.compress_for_api(image_bytes)
-    last_err = None
-
-    for attempt in range(max_retries + 1):
-        base64_img = encode_image(compressed)
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}},
-                    ],
-                }
-            ],
-            "temperature": 0.1,
-        }
-        try:
-            res = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
-            res.raise_for_status()
-            message = res.json()["choices"][0]["message"]
-            content_text = (message.get("content") or "").strip()
-            if not content_text:
-                content_text = (message.get("reasoning_content") or "").strip()
-            if not content_text:
-                raise ValueError("Provider mengembalikan respons kosong (tidak ada konten teks).")
-            return content_text
-        except requests.exceptions.HTTPError as e:
-            last_err = e
-            status_code = e.response.status_code if e.response is not None else None
-            if status_code == 413 and attempt < max_retries:
-                # masih kegedean -> kompres lebih agresif lalu coba lagi
-                compressed = image_utils.compress_for_api(image_bytes, max_dim=1000, quality=55, max_bytes=700_000)
-                continue
-            raise
-        except requests.exceptions.Timeout as e:
-            last_err = e
-            if attempt < max_retries:
-                continue  # retry sekali lagi sebelum menyerah
-            raise
-        except requests.exceptions.RequestException as e:
-            last_err = e
-            raise
-
-    raise last_err
+# ─────────────────────────────────────────────────────────────────────────
+# Panggil vision API
+# ─────────────────────────────────────────────────────────────────────────
 
 
 def _extract_json(text: str):
     """Ambil JSON dari respons model yang mungkin dibungkus markdown atau
-    diapit teks lain. Melempar ValueError yang jelas kalau memang tidak ada
-    JSON sama sekali -- ini yang menangkap provider 'nakal' yang membalas
-    HTTP 200 tapi isinya bukan hasil OCR (mis. kalimat acak)."""
-    cleaned = re.sub(r"```(?:json)?", "", str(text)).strip()
+    diapit teks lain. Melempar ValueError bila memang tidak ada JSON valid —
+    ini yang menangkap provider 'nakal' yang membalas HTTP 200 tapi isinya
+    bukan hasil OCR (mis. kalimat acak)."""
+    cleaned = re.sub(r"```(?:json)?|```", "", str(text)).strip()
     try:
         return json.loads(cleaned)
     except (ValueError, TypeError):
@@ -271,66 +263,92 @@ def _extract_json(text: str):
                     depth -= 1
                     if depth == 0:
                         try:
-                            return json.loads(cleaned[start:i + 1])
+                            return json.loads(cleaned[start : i + 1])
                         except (ValueError, TypeError):
                             break
             start = cleaned.find(opener, start + 1)
 
     snippet = cleaned[:200].replace("\n", " ")
-    raise ValueError(f"Respons model bukan JSON valid — gambar kemungkinan tidak diproses. Respons: {snippet!r}")
+    raise ValueError(f"Respons model bukan JSON valid. Raw output: '{snippet}'")
 
 
-def _provider_plans(provider_name: str, model: str, results: dict | None) -> list:
-    """Susun urutan (provider, model) yang akan dicoba: provider terpilih lebih
-    dulu, lalu provider lain yang sehat memakai model vision pertamanya. Ini
-    yang membuat OCR tetap jalan walau provider terpilih ternyata rusak (mis.
-    proxy yang membalas HTTP 200 tapi isinya bukan hasil OCR)."""
-    plans = []
-    if provider_name and model:
-        plans.append((provider_name, model))
-    for pname, r in (results or {}).items():
-        if pname == provider_name or not r.get("ok"):
-            continue
-        models = r.get("models") or []
-        if models:
-            plans.append((pname, models[0]))
-    return plans
+def _call_vision_once(
+    provider_name: str,
+    model: str,
+    image_bytes: bytes,
+    prompt: str,
+    timeout: int,
+    retries: int,
+):
+    """Satu percobaan ke satu (provider, model) dengan retry/backoff."""
+    cfg = PROVIDERS[provider_name]
+    url = f"{cfg['base_url']}/chat/completions"
+    headers = {**_auth_headers(cfg), "Content-Type": "application/json"}
 
+    prepared = prepare_image(image_bytes)
+    b64 = base64.b64encode(prepared).decode("utf-8")
 
-def call_vision_api(provider_name: str, model: str, image_bytes: bytes, results: dict | None = None) -> dict:
-    """Ekstraksi satu foto struk fisik (bensin/parkir/drink) -> satu dict transaksi.
-    Mencoba provider terpilih dulu, lalu fallback ke provider sehat lainnya
-    kalau responsnya tidak valid (lihat `_provider_plans`)."""
-    plans = _provider_plans(provider_name, model, results) or [(provider_name, model)]
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            }
+        ],
+        "temperature": 0.1,
+    }
+
     last_err = None
-    for pname, m in plans:
+    for attempt in range(retries + 1):
         try:
-            content_text = _vision_chat_raw(pname, m, image_bytes, EXTRACTION_PROMPT)
-            data = _extract_json(content_text)
-            if not isinstance(data, dict):
-                raise ValueError("Respons OCR bukan objek JSON — gambar kemungkinan tidak diproses model.")
-            return data
-        except Exception as e:  # coba provider berikutnya, jangan langsung menyerah
-            last_err = e
-    raise last_err
-
-
-def call_vision_api_flazz(provider_name: str, model: str, image_bytes: bytes, results: dict | None = None) -> list:
-    """Ekstraksi satu screenshot riwayat Flazz/e-money -> list beberapa transaksi sekaligus."""
-    plans = _provider_plans(provider_name, model, results) or [(provider_name, model)]
-    last_err = None
-    for pname, m in plans:
-        try:
-            content_text = _vision_chat_raw(pname, m, image_bytes, EXTRACTION_PROMPT_FLAZZ)
-            parsed = _extract_json(content_text)
-            if isinstance(parsed, dict):
-                for v in parsed.values():
-                    if isinstance(v, list):
-                        return v
-                return []
-            if isinstance(parsed, list):
-                return parsed
-            raise ValueError("Respons OCR Flazz bukan JSON array.")
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            r.raise_for_status()
+            try:
+                raw_content = r.json()["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                raise ValueError(
+                    f"Format respons tidak dikenali dari {provider_name}: {r.text[:200]}"
+                )
+            if not raw_content:
+                raise ValueError("Respons model kosong (empty response).")
+            return _extract_json(raw_content)
         except Exception as e:
             last_err = e
-    raise last_err
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))  # backoff: 2s, 4s
+    raise last_err if last_err else RuntimeError("call_vision gagal")
+
+
+def call_vision(
+    provider_name: str,
+    model: str,
+    image_bytes: bytes,
+    prompt: str,
+    timeout: int = 120,
+    retries: int = 2,
+    fallbacks: list | None = None,
+) -> dict:
+    """Kirim satu gambar + prompt ke model vision. Return objek JSON (dict/list).
+
+    - image_bytes di-resize dulu (prepare_image) untuk hindari 413.
+    - timeout panjang + retry/backoff untuk read timeout.
+    - `fallbacks`: daftar (provider, model) cadangan yang dicoba otomatis bila
+      provider terpilih gagal / balasannya bukan JSON valid. Ini membuat OCR
+      tetap jalan walau provider terpilih ternyata rusak (mis. proxy yang
+      membalas HTTP 200 tapi isinya bukan hasil OCR)."""
+    plans = [(provider_name, model)]
+    for fb in fallbacks or []:
+        if fb not in plans:
+            plans.append(tuple(fb))
+
+    last_err = None
+    for pname, m in plans:
+        try:
+            return _call_vision_once(pname, m, image_bytes, prompt, timeout, retries)
+        except Exception as e:
+            last_err = e
+    raise last_err if last_err else RuntimeError("call_vision gagal")
