@@ -1,6 +1,15 @@
+# Secrets asli JANGAN pernah di-commit
 .streamlit/secrets.toml
+
+# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+env/
+
+# OS / editor
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
