@@ -156,7 +156,7 @@ if st.button("🚀 Mulai Proses OCR, Sorting, Generate Excel & PDF", type="prima
                 img_bytes = file.getvalue()
                 pdf_image_bytes_list.append(img_bytes)
                 try:
-                    parsed = llm_core.call_vision_api(provider_name, selected_model, img_bytes)
+                    parsed = llm_core.call_vision_api(provider_name, selected_model, img_bytes, results)
 
                     # Fallback GPS: kalau kategori parkir & tidak ada nama lokasi,
                     # coba baca EXIF GPS foto lalu reverse-geocode.
@@ -182,7 +182,7 @@ if st.button("🚀 Mulai Proses OCR, Sorting, Generate Excel & PDF", type="prima
                 img_bytes = file.getvalue()
                 pdf_image_bytes_list.append(img_bytes)
                 try:
-                    parsed_list = llm_core.call_vision_api_flazz(provider_name, selected_model, img_bytes)
+                    parsed_list = llm_core.call_vision_api_flazz(provider_name, selected_model, img_bytes, results)
                     flazz_items_raw.extend(parsed_list)
                 except Exception as e:
                     failures.append((file.name, str(e)))
@@ -204,9 +204,10 @@ if st.button("🚀 Mulai Proses OCR, Sorting, Generate Excel & PDF", type="prima
         skipped_dupe = flazz_parking_raw_count - len(flazz_deduped)
         combined_items = extracted_items + flazz_deduped
 
+        st.session_state.extracted_items = combined_items
+        st.session_state.pdf_image_bytes_list = pdf_image_bytes_list
+
         if combined_items:
-            st.session_state.extracted_items = combined_items
-            st.session_state.pdf_image_bytes_list = pdf_image_bytes_list
             msg = f"Ekstraksi selesai: {len(extracted_items)} struk"
             if flazz_files:
                 msg += f" + {len(flazz_deduped)} transaksi parkir dari Flazz"
@@ -214,12 +215,16 @@ if st.button("🚀 Mulai Proses OCR, Sorting, Generate Excel & PDF", type="prima
                     msg += f" ({skipped_dupe} duplikat di-skip karena sudah ada struk fotonya)"
             st.success(msg + ".")
         else:
-            st.error("Tidak ada data yang berhasil diekstrak.")
+            st.error(
+                "Tidak ada data yang berhasil diekstrak dari gambar. "
+                "PDF gabungan foto tetap bisa diunduh di bawah; periksa pesan error tiap file di atas."
+            )
 
 # ─────────────────────────────────────────────────────────────────────────
 # HASIL & DOWNLOAD -- Excel dan PDF dibuat & ditampilkan SECARA TERPISAH,
 # supaya kalau salah satu gagal, yang lain tetap bisa didownload.
 # ─────────────────────────────────────────────────────────────────────────
+df = None
 if st.session_state.extracted_items:
     df = excel_core.build_rows(st.session_state.extracted_items)
     display_df = df.copy()
@@ -227,9 +232,12 @@ if st.session_state.extracted_items:
     st.dataframe(display_df, use_container_width=True)
     st.markdown(f"**Total: Rp {df['nominal'].sum():,.0f}**".replace(",", "."))
 
-    dcol1, dcol2 = st.columns(2)
+dcol1, dcol2 = st.columns(2)
 
-    with dcol1:
+with dcol1:
+    if df is None:
+        st.info("Excel belum bisa dibuat karena tidak ada data struk yang terbaca.")
+    else:
         try:
             excel_bytes = excel_core.fill_excel_template(
                 df,
@@ -245,7 +253,10 @@ if st.session_state.extracted_items:
         except Exception as e:
             st.error(f"Gagal membuat file Excel: {e}")
 
-    with dcol2:
+with dcol2:
+    if not st.session_state.pdf_image_bytes_list:
+        st.info("Belum ada gambar untuk digabungkan ke PDF.")
+    else:
         try:
             pdf_bytes = pdf_core.merge_images_to_pdf(st.session_state.pdf_image_bytes_list)
             st.download_button(
